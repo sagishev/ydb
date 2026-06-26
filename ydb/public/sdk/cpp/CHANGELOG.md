@@ -1,6 +1,6 @@
 * Added a flag to support deferred session creation(when client timeout exceeded, the session is created in the backgroud)
 
-* Added a distributed lock primitive based on the coordination service. The lock implements the BasicLockable concept and can be created directly or from a coordination session pool.
+* Added a distributed lock primitive based on the coordination service. The lock can be used with `std::lock_guard`-style code and can be created directly or from a coordination session pool.
 
 # v3.20.0
 
