@@ -22,9 +22,9 @@ public:
         return StopSource_.get_token();
     }
 
-    void Reset() {
+    void Reset(std::stop_source stopSource) {
         std::lock_guard guard(Lock_);
-        StopSource_ = std::stop_source{};
+        StopSource_ = std::move(stopSource);
     }
 
     void RequestStop() {
@@ -53,7 +53,7 @@ struct TDistributedLock::TImpl {
                 lockSettings.Path_,
                 TCoordinationSessionPoolSettings()
                     .PoolSize(1)
-                    .SessionSettings(TSessionSettings().Timeout(lockSettings.Timeout_))),
+                    .SessionSettings(TSessionSettings().Timeout(lockSettings.SessionTimeout_))),
             lockSettings)
     {
     }
@@ -62,31 +62,46 @@ struct TDistributedLock::TImpl {
         : Pool_(std::move(pool))
         , Name_(lockSettings.Name_)
         , Timeout_(lockSettings.Timeout_)
-        , LockLossState_(std::make_shared<TLockLossState>())
     {
     }
 
     ~TImpl() {
+        if (Locked_) {
+            LockLossState_.RequestStop();
+        }
         Locked_ ? ReplaceSession() : ReturnSession();
     }
 
     std::stop_token GetStopToken() const {
-        return LockLossState_->GetStopToken();
+        return LockLossState_.GetStopToken();
     }
 
     bool try_lock() noexcept {
-        return TryAcquire() == EAcquireResult::Acquired;
+        return TryAcquire(Min(TDuration::MilliSeconds(100), ServerAcquireTimeout())) == EAcquireResult::Acquired;
     }
 
     void lock() {
-        switch (TryAcquire()) {
-            case EAcquireResult::Acquired:
-                return;
-            case EAcquireResult::NoSession:
-                throw TYdbLockException("Failed to start session");
-            case EAcquireResult::NotAcquired:
-            case EAcquireResult::Failed:
+        const auto deadline = TInstant::Now() + Timeout_;
+        while (true) {
+            const auto remaining = deadline - TInstant::Now();
+            if (remaining <= TDuration::Zero()) {
                 throw TYdbLockException("Failed to acquire semaphore");
+            }
+
+            const auto acquireTimeout = Min(ServerAcquireTimeout(), remaining * SERVER_ACQUIRE_TIMEOUT_FRACTION);
+            switch (TryAcquire(acquireTimeout)) {
+                case EAcquireResult::Acquired:
+                    return;
+                case EAcquireResult::NotAcquired:
+                case EAcquireResult::NoSession:
+                    break;
+                case EAcquireResult::Failed:
+                    throw TYdbLockException("Failed to acquire semaphore");
+            }
+
+            if (const auto sleep = deadline - TInstant::Now(); sleep > TDuration::Zero()) {
+                Sleep(Min(sleep / 2, TDuration::MilliSeconds(50)));
+            }
         }
     }
 
@@ -110,7 +125,7 @@ struct TDistributedLock::TImpl {
         }
 
         if (releaseFailed) {
-            LockLossState_->RequestStop();
+            LockLossState_.RequestStop();
             ReplaceSession();
         } else {
             ReturnSession();
@@ -119,12 +134,9 @@ struct TDistributedLock::TImpl {
     }
 
 private:
-    std::function<void()> MakeLockLossCallback() const {
-        std::weak_ptr<TLockLossState> weakLockLoss = LockLossState_;
-        return [weakLockLoss] {
-            if (auto lockLoss = weakLockLoss.lock()) {
-                lockLoss->RequestStop();
-            }
+    std::function<void()> MakeLockLossCallback(std::stop_source stopSource) const {
+        return [stopSource = std::move(stopSource)]() mutable {
+            stopSource.request_stop();
         };
     }
 
@@ -140,13 +152,13 @@ private:
         return Timeout_ * SERVER_ACQUIRE_TIMEOUT_FRACTION;
     }
 
-    bool EnsureSession() noexcept {
+    bool EnsureSession(std::stop_source& stopSource) noexcept {
         if (Session_) {
             return true;
         }
 
         try {
-            auto session = Pool_.GetAny(MakeLockLossCallback());
+            auto session = Pool_.GetAny(MakeLockLossCallback(stopSource));
             if (!session) {
                 return false;
             }
@@ -158,27 +170,35 @@ private:
     }
 
     void ReturnSession() noexcept {
-        if (Session_) {
-            Pool_.Return(std::move(Session_));
-            Session_ = {};
-        }
+        ReleaseSession(false);
     }
 
     void ReplaceSession() noexcept {
+        ReleaseSession(true);
+    }
+
+    void ReleaseSession(bool replace) noexcept {
         if (Session_) {
-            Pool_.Replace(std::move(Session_));
+            try {
+                if (replace) {
+                    Pool_.Replace(std::move(Session_));
+                } else {
+                    Pool_.Return(std::move(Session_));
+                }
+            } catch (...) {
+            }
             Session_ = {};
         }
     }
 
-    EAcquireResult TryAcquire() noexcept try {
-        if (!EnsureSession()) {
+    EAcquireResult TryAcquire(TDuration acquireTimeout) noexcept try {
+        std::stop_source stopSource;
+        if (!EnsureSession(stopSource)) {
             return EAcquireResult::NoSession;
         }
 
-        LockLossState_->Reset();
-        auto acquireFuture = Session_.AcquireSemaphore(Name_, MakeAcquireSettings(ServerAcquireTimeout()));
-        if (!acquireFuture.Wait(Timeout_)) {
+        auto acquireFuture = Session_.AcquireSemaphore(Name_, MakeAcquireSettings(acquireTimeout));
+        if (!acquireFuture.Wait(acquireTimeout * (1 / SERVER_ACQUIRE_TIMEOUT_FRACTION))) {
             ReplaceSession();
             return EAcquireResult::Failed;
         }
@@ -194,6 +214,7 @@ private:
             return EAcquireResult::NotAcquired;
         }
 
+        LockLossState_.Reset(std::move(stopSource));
         Locked_ = true;
         return EAcquireResult::Acquired;
     } catch (...) {
@@ -206,7 +227,7 @@ private:
     TSession Session_;
     std::string Name_;
     TDuration Timeout_;
-    std::shared_ptr<TLockLossState> LockLossState_;
+    TLockLossState LockLossState_;
     bool Locked_ = false;
 };
 
