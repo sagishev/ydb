@@ -10,6 +10,7 @@ SRCS(
 
 PEERDIR(
     ydb/core/protos
+    ydb/core/tx/columnshard/engines/protos  # stopgap: includes top-level columnshard_private_events.h (cycle)
     ydb/library/actors/core
     ydb/core/tablet_flat
 )
